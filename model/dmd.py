@@ -6,6 +6,31 @@ import torch
 from model.base import SelfForcingModel
 
 
+def project_update(direction, residual, eps=1e-8):
+    """PDMD (arXiv 2609.35768, Eq. 4): drop the per-sample component of `direction` parallel to `residual`."""
+    d, r = direction.float(), residual.detach().float()
+    dims = tuple(range(1, d.ndim))
+    rr = r.square().sum(dims, keepdim=True)
+    dr = (d * r).sum(dims, keepdim=True)
+    return d - dr / (rr + eps) * r
+
+
+def motion_part(x):
+    """Temporal residual of [B, F, ...] around its mean frame (= every non-DC term of a time-axis DCT)."""
+    return x - x.mean(dim=1, keepdim=True)
+
+
+def motion_ratio(x):
+    """Share of ||x||^2 in the motion part; mean frame and residual are orthogonal, so the shares add to 1."""
+    x = x.float()
+    return (motion_part(x).square().sum() / x.square().sum().clamp_min(1e-12)).detach()
+
+
+def frame_diff_energy(x):
+    x = x.float()
+    return (x[:, 1:] - x[:, :-1]).square().mean().detach()
+
+
 class DMD(SelfForcingModel):
     def __init__(self, args, device):
         """
@@ -45,6 +70,9 @@ class DMD(SelfForcingModel):
         self.ts_schedule = getattr(args, "ts_schedule", True)
         self.ts_schedule_max = getattr(args, "ts_schedule_max", False)
         self.min_score_timestep = getattr(args, "min_score_timestep", 0)
+        self.pdmd = getattr(args, "pdmd", False)
+        # Scales the temporal-residual part of the DMD grad; 1.0 = vanilla DMD.
+        self.dmd_motion_weight = getattr(args, "dmd_motion_weight", 1.0)
 
         if getattr(self.scheduler, "alphas_cumprod", None) is not None:
             self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
@@ -112,6 +140,22 @@ class DMD(SelfForcingModel):
         # Step 3: Compute the DMD gradient (DMD paper eq. 7).
         grad = (pred_fake_image - pred_real_image)
 
+        log_dict = {}
+        if self.pdmd:
+            # Same order as the official impl: project first, then the shared mean|p_real| normalizer.
+            raw_norm = grad.float().flatten(1).norm(dim=1)
+            grad = project_update(grad, pred_fake_image - estimated_clean_image_or_video)
+            log_dict["pdmd_kept_norm_ratio"] = (grad.flatten(1).norm(dim=1) / raw_norm.clamp_min(1e-12)).mean().detach()
+
+        # Diagnostics: motion share of the grad vs. of the sample, and frame-diff energy of student / teacher / critic.
+        log_dict["dmd_grad_motion_ratio"] = motion_ratio(grad)
+        log_dict["student_motion_ratio"] = motion_ratio(estimated_clean_image_or_video)
+        log_dict["motion_energy_student"] = frame_diff_energy(estimated_clean_image_or_video)
+        log_dict["motion_energy_real"] = frame_diff_energy(pred_real_image)
+        log_dict["motion_energy_fake"] = frame_diff_energy(pred_fake_image)
+        if self.dmd_motion_weight != 1.0:
+            grad = grad + (self.dmd_motion_weight - 1.0) * motion_part(grad)
+
         # TODO: Change the normalizer for causal teacher
         if normalization:
             # Step 4: Gradient normalization (DMD paper eq. 8).
@@ -122,7 +166,8 @@ class DMD(SelfForcingModel):
 
         return grad, {
             "dmdtrain_gradient_norm": torch.mean(torch.abs(grad)).detach(),
-            "timestep": timestep.detach()
+            "timestep": timestep.detach(),
+            **log_dict
         }
 
     def compute_distribution_matching_loss(

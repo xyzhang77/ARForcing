@@ -12,7 +12,7 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import CausVid, DMD, SiD
 import torch
-import wandb
+from torch.utils.tensorboard import SummaryWriter
 import time
 import os
 
@@ -30,11 +30,26 @@ class Trainer:
         global_rank = dist.get_rank()
         self.world_size = dist.get_world_size()
 
+        if type(config.batch_size) is not int or config.batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        global_micro_batch_size = config.batch_size * self.world_size
+        total_batch_size = getattr(config, "total_batch_size", global_micro_batch_size)
+        if (type(total_batch_size) is not int or total_batch_size <= 0 or
+                total_batch_size % global_micro_batch_size != 0):
+            raise ValueError(
+                "total_batch_size must be a positive integer multiple of "
+                f"batch_size * world_size ({global_micro_batch_size}), got {total_batch_size!r}"
+            )
+        self.gradient_accumulation_steps = total_batch_size // global_micro_batch_size
+        if global_rank == 0:
+            print(f"Gradient accumulation: {self.gradient_accumulation_steps} microbatches; "
+                  f"global batch size: {total_batch_size}")
+
         self.dtype = torch.bfloat16 if config.mixed_precision else torch.float32
         self.device = torch.cuda.current_device()
         self.is_main_process = global_rank == 0
         self.causal = config.causal
-        self.disable_wandb = config.disable_wandb
+        self.writer = None
 
         # use a random seed for the training
         if config.seed == 0:
@@ -44,18 +59,11 @@ class Trainer:
 
         set_seed(config.seed + global_rank)
 
-        if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
-            wandb.init(
-                config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
-                mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
-                dir=config.wandb_save_dir
-            )
+        if self.is_main_process and not config.disable_tensorboard:
+            self.writer = SummaryWriter(log_dir=config.tensorboard_save_dir, flush_secs=10)
+            self.writer.add_text("config", f"```yaml\n{OmegaConf.to_yaml(config, resolve=True)}\n```", 0)
 
-        self.output_path = config.logdir
+        self.output_path = config.checkpoint_dir
 
         # Step 2: Initialize the model and optimizer
         if config.distribution_loss == "causvid":
@@ -130,7 +138,10 @@ class Trainer:
             dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=8)
+            num_workers=8,
+            drop_last=True)
+        if len(dataloader) == 0:
+            raise ValueError("Dataset must provide at least one full batch per rank")
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
@@ -199,12 +210,10 @@ class Trainer:
             }
 
         if self.is_main_process:
-            os.makedirs(os.path.join(self.output_path,
-                        f"checkpoint_model_{self.step:06d}"), exist_ok=True)
-            torch.save(state_dict, os.path.join(self.output_path,
-                       f"checkpoint_model_{self.step:06d}", "model.pt"))
-            print("Model saved to", os.path.join(self.output_path,
-                  f"checkpoint_model_{self.step:06d}", "model.pt"))
+            os.makedirs(self.output_path, exist_ok=True)
+            ckpt_path = os.path.join(self.output_path, f"step_{self.step:06d}.pt")
+            torch.save(state_dict, ckpt_path)
+            print("Model saved to", ckpt_path)
 
     def fwdbwd_one_step(self, batch, train_generator):
         self.model.eval()  # prevent any randomness (e.g. dropout)
@@ -250,16 +259,10 @@ class Trainer:
                 initial_latent=image_latent if self.config.i2v else None
             )
 
-            generator_loss.backward()
-            generator_grad_norm = self.model.generator.clip_grad_norm_(
-                self.max_grad_norm_generator)
-
-            generator_log_dict.update({"generator_loss": generator_loss,
-                                       "generator_grad_norm": generator_grad_norm})
+            (generator_loss / self.gradient_accumulation_steps).backward()
+            generator_log_dict.update({"generator_loss": generator_loss.detach()})
 
             return generator_log_dict
-        else:
-            generator_log_dict = {}
 
         # Step 4: Store gradients for the critic (if training the critic)
         critic_loss, critic_log_dict = self.model.critic_loss(
@@ -270,12 +273,8 @@ class Trainer:
             initial_latent=image_latent if self.config.i2v else None
         )
 
-        critic_loss.backward()
-        critic_grad_norm = self.model.fake_score.clip_grad_norm_(
-            self.max_grad_norm_critic)
-
-        critic_log_dict.update({"critic_loss": critic_loss,
-                                "critic_grad_norm": critic_grad_norm})
+        (critic_loss / self.gradient_accumulation_steps).backward()
+        critic_log_dict.update({"critic_loss": critic_loss.detach()})
 
         return critic_log_dict
 
@@ -319,10 +318,13 @@ class Trainer:
             if TRAIN_GENERATOR:
                 self.generator_optimizer.zero_grad(set_to_none=True)
                 extras_list = []
-                batch = next(self.dataloader)
-                extra = self.fwdbwd_one_step(batch, True)
-                extras_list.append(extra)
+                for _ in range(self.gradient_accumulation_steps):
+                    batch = next(self.dataloader)
+                    extra = self.fwdbwd_one_step(batch, True)
+                    extras_list.append(extra)
                 generator_log_dict = merge_dict_list(extras_list)
+                generator_log_dict["generator_grad_norm"] = self.model.generator.clip_grad_norm_(
+                    self.max_grad_norm_generator)
                 self.generator_optimizer.step()
                 if self.generator_ema is not None:
                     self.generator_ema.update(self.model.generator)
@@ -330,10 +332,13 @@ class Trainer:
             # Train the critic
             self.critic_optimizer.zero_grad(set_to_none=True)
             extras_list = []
-            batch = next(self.dataloader)
-            extra = self.fwdbwd_one_step(batch, False)
-            extras_list.append(extra)
+            for _ in range(self.gradient_accumulation_steps):
+                batch = next(self.dataloader)
+                extra = self.fwdbwd_one_step(batch, False)
+                extras_list.append(extra)
             critic_log_dict = merge_dict_list(extras_list)
+            critic_log_dict["critic_grad_norm"] = self.model.fake_score.clip_grad_norm_(
+                self.max_grad_norm_critic)
             self.critic_optimizer.step()
 
             # Increment the step since we finished gradient update
@@ -352,25 +357,30 @@ class Trainer:
 
             # Logging
             if self.is_main_process:
-                wandb_loss_dict = {}
+                loss_dict = {}
                 if TRAIN_GENERATOR:
-                    wandb_loss_dict.update(
+                    loss_dict.update(
                         {
                             "generator_loss": generator_log_dict["generator_loss"].mean().item(),
                             "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
                             "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
                         }
                     )
+                    for key in ("pdmd_kept_norm_ratio", "dmd_grad_motion_ratio", "student_motion_ratio",
+                                "motion_energy_student", "motion_energy_real", "motion_energy_fake"):
+                        if key in generator_log_dict:
+                            loss_dict[key] = generator_log_dict[key].mean().item()
 
-                wandb_loss_dict.update(
+                loss_dict.update(
                     {
                         "critic_loss": critic_log_dict["critic_loss"].mean().item(),
                         "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
                     }
                 )
 
-                if not self.disable_wandb:
-                    wandb.log(wandb_loss_dict, step=self.step)
+                if self.writer is not None:
+                    for name, value in loss_dict.items():
+                        self.writer.add_scalar(name, value, self.step)
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:
@@ -383,6 +393,12 @@ class Trainer:
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    if self.writer is not None:
+                        self.writer.add_scalar("per iteration time", current_time - self.previous_time, self.step)
                     self.previous_time = current_time
+
+            if self.step >= getattr(self.config, "max_step", float("inf")):
+                if (not self.config.no_save) and self.step % self.config.log_iters != 0:
+                    torch.cuda.empty_cache()
+                    self.save()
+                break

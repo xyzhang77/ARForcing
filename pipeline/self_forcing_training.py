@@ -16,6 +16,7 @@ class SelfForcingTrainingPipeline:
                  last_step_only: bool = False,
                  num_max_frames: int = 21,
                  context_noise: int = 0,
+                 cache_final_x0: bool = False,
                  **kwargs):
         super().__init__()
         self.scheduler = scheduler
@@ -29,6 +30,8 @@ class SelfForcingTrainingPipeline:
         self.frame_seq_length = 1560
         self.num_frame_per_block = num_frame_per_block
         self.context_noise = context_noise
+        # Write the KV cache from the last-step x0 (as inference does) instead of the exit-step x0.
+        self.cache_final_x0 = cache_final_x0
         self.i2v = False
 
         self.kv_cache1 = None
@@ -191,10 +194,29 @@ class SelfForcingTrainingPipeline:
                             crossattn_cache=self.crossattn_cache,
                             current_start=current_start_frame * self.frame_seq_length
                         )
+                    exit_pred = denoised_pred
+                    if self.cache_final_x0:
+                        # Finish the remaining steps without grad; only their last x0 goes into the cache.
+                        with torch.no_grad():
+                            for next_timestep in self.denoising_step_list[index + 1:]:
+                                noisy_input = self.scheduler.add_noise(
+                                    denoised_pred.flatten(0, 1),
+                                    torch.randn_like(denoised_pred.flatten(0, 1)),
+                                    next_timestep * torch.ones(
+                                        [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
+                                ).unflatten(0, denoised_pred.shape[:2])
+                                _, denoised_pred = self.generator(
+                                    noisy_image_or_video=noisy_input,
+                                    conditional_dict=conditional_dict,
+                                    timestep=torch.ones_like(timestep) * next_timestep,
+                                    kv_cache=self.kv_cache1,
+                                    crossattn_cache=self.crossattn_cache,
+                                    current_start=current_start_frame * self.frame_seq_length
+                                )
                     break
 
-            # Step 3.2: record the model's output
-            output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
+            # Step 3.2: record the model's output (exit-step x0, carries the DMD gradient)
+            output[:, current_start_frame:current_start_frame + current_num_frames] = exit_pred
 
             # Step 3.3: rerun with timestep zero to update the cache
             context_timestep = torch.ones_like(timestep) * self.context_noise

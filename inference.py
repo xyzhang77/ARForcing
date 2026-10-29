@@ -4,7 +4,7 @@ import os
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchvision import transforms
-from torchvision.io import write_video
+import imageio.v2 as imageio
 from einops import rearrange
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
@@ -33,19 +33,22 @@ parser.add_argument("--seed", type=int, default=0, help="Random seed")
 parser.add_argument("--num_samples", type=int, default=1, help="Number of samples to generate per prompt")
 parser.add_argument("--save_with_index", action="store_true",
                     help="Whether to save the video using the index or prompt as the filename")
+parser.add_argument("--cache_step", type=int, default=-1,
+                    help="0-based denoising step whose x0 is written to the KV cache (-1 = last step)")
 args = parser.parse_args()
 
 # Initialize distributed inference
 if "LOCAL_RANK" in os.environ:
-    dist.init_process_group(backend='nccl')
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend='nccl')
     device = torch.device(f"cuda:{local_rank}")
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    set_seed(args.seed + local_rank)
+    set_seed(args.seed + rank)
 else:
     device = torch.device("cuda")
-    local_rank = 0
+    rank = 0
     world_size = 1
     set_seed(args.seed)
 
@@ -57,6 +60,7 @@ torch.set_grad_enabled(False)
 config = OmegaConf.load(args.config_path)
 default_config = OmegaConf.load("configs/default_config.yaml")
 config = OmegaConf.merge(default_config, config)
+config.cache_step = args.cache_step
 
 # Initialize pipeline
 if hasattr(config, 'denoising_step_list'):
@@ -94,13 +98,13 @@ num_prompts = len(dataset)
 print(f"Number of prompts: {num_prompts}")
 
 if dist.is_initialized():
-    sampler = DistributedSampler(dataset, shuffle=False, drop_last=True)
+    sampler = DistributedSampler(dataset, shuffle=False, drop_last=False)
 else:
     sampler = SequentialSampler(dataset)
 dataloader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=0, drop_last=False)
 
 # Create output directory (only on main process to avoid race conditions)
-if local_rank == 0:
+if rank == 0:
     os.makedirs(args.output_folder, exist_ok=True)
 
 if dist.is_initialized():
@@ -120,7 +124,7 @@ def encode(self, videos: torch.Tensor) -> torch.Tensor:
     return output
 
 
-for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
+for i, batch_data in tqdm(enumerate(dataloader), disable=(rank != 0)):
     idx = batch_data['idx'].item()
 
     # For DataLoader batch_size=1, the batch_data is already a single item, but in a batch container
@@ -151,6 +155,9 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     else:
         # For text-to-video, batch is just the text prompt
         prompt = batch['prompts'][0]
+        # Repeated benchmark prompts share filenames, so only the first row writes them.
+        if not args.save_with_index and dataset.prompt_list.index(prompt) != idx:
+            continue
         extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
         if extended_prompt is not None:
             prompts = [extended_prompt] * args.num_samples
@@ -180,13 +187,16 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     # Clear VAE cache
     pipeline.vae.model.clear_cache()
 
-    # Save the video if the current prompt is not a dummy prompt
-    if idx < num_prompts:
+    # With shuffle=False and batch_size=1, padded entries follow the original prompts.
+    if i * world_size + rank < num_prompts:
         model = "regular" if not args.use_ema else "ema"
         for seed_idx in range(args.num_samples):
             # All processes save their videos
             if args.save_with_index:
                 output_path = os.path.join(args.output_folder, f'{idx}-{seed_idx}_{model}.mp4')
             else:
-                output_path = os.path.join(args.output_folder, f'{prompt[:100]}-{seed_idx}.mp4')
-            write_video(output_path, video[seed_idx], fps=16)
+                output_path = os.path.join(args.output_folder, f'{prompt}-{seed_idx}.mp4')
+            imageio.mimwrite(
+                output_path, video[seed_idx].to(torch.uint8).numpy(),
+                fps=16, codec='libx264', quality=None, macro_block_size=1,
+            )

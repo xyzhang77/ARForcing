@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>同噪声水平下的结构保留与样本差异 · AR / Wan</title>
+  <style>__REPORT_CSS__</style>
+</head>
+<body>
+<a class="skip" href="#samples">跳至样本对照</a>
+<header class="page-head wrap">
+  <div class="eyebrow">FIRST-STEP NOISE EXPERIMENT <span>2026.10.23</span></div>
+  <h1>早期结构保留，与跨 seed 的多样性</h1>
+  <p class="lead">同一 prompt、同一组初始噪声，将 AR 与 Wan 对齐到 <strong>σ = 0.9375</strong> 后，比较 clean x₀ 预测及其最终结果。</p>
+  <div class="meta"><span>3 个 prompt</span><span>每个 8 个 seed</span><span>__CASE_COUNT__ 条模型轨迹</span><span>首 chunk · 帧 0 / 4 / 8</span><span class="legend ar">AR 蒸馏四步</span><span class="legend wan">Wan 双向 48 步</span></div>
+  <nav aria-label="报告目录"><a href="#samples">看样本</a><a href="#diversity">看 diversity 证据</a><a href="#retention">看结构保留</a><a href="#controls">看后续噪声</a><a href="#appendix">数据与方法</a></nav>
+</header>
+<main class="wrap">
+  <section class="verdict" aria-labelledby="verdict-title">
+    <div class="eyebrow">本次实验能说明什么</div>
+    <h2 id="verdict-title">支持早期结构保留；diversity 只得到探索性证据</h2>
+    <p id="verdict-detail">在同噪声水平，早期 x₀ 已保留可辨认的样本特征。AR 与 Wan 在这批样本中的构图与场景偏好有差异；当前指标和样本量还不足以证明总体语义多样性的高低。</p>
+    <div class="conclusion-grid">
+      <article><span class="card-label">较强的样本内证据</span><h3>早期可以认出自己的 final</h3><p id="retention-headline">低通 RGB 检索结果加载中。</p><a href="#retention">查看检索定义 →</a></article>
+      <article><span class="card-label">探索性差异</span><h3>“更集中”依赖 prompt 与指标</h3><p>跨 seed 低通 RGB 距离可以量化颜色和粗布局的分散程度；它不能覆盖场景类别、物体和动作的全部变化。</p><a href="#diversity">查看逐 prompt 证据 →</a></article>
+      <article><span class="card-label">结论边界</span><h3>还不能归因于 AR attention</h3><p>这里比较的是两套完整采样系统，权重、蒸馏、CFG 与时间上下文也不同。后续噪声仍能改变结果。</p><a href="#controls">查看干预结果 →</a></article>
+    </div>
+  </section>
+
+  <section class="alignment panel" aria-labelledby="alignment-title">
+    <div><h2 id="alignment-title">先对齐噪声水平，再比较</h2><p class="muted">更新次数不同，观察状态的 σ 相同。下方默认显示的是此状态上的 clean x₀ 预测。</p></div>
+    <div class="alignment-lanes">
+      <div class="lane ar"><strong>AR</strong><span>初噪 σ = 1</span><span class="arrow">→</span><b>完成 1 次更新 / 重加噪</b><span class="arrow">→</span><span class="sigma">σ = 0.9375</span><span class="probe">读取 x₀</span></div>
+      <div class="lane wan"><strong>Wan</strong><span>初噪 σ = 1</span><span class="arrow">→</span><b>完成 12 次 Euler 更新</b><span class="arrow">→</span><span class="sigma">σ = 0.9375</span><span class="probe">读取 x₀</span></div>
+    </div>
+    <p class="footnote">x₀ probe 只读取当前状态，不增加已完成更新数。同 σ 表示相同噪声水平，不表示两模型的带噪 state 张量相同。</p>
+  </section>
+
+  <section id="samples" class="section-block" aria-labelledby="samples-title">
+    <div class="section-heading"><div><div class="eyebrow">01 · 先看同一 prompt 的全部 seed</div><h2 id="samples-title">同 σ 图像对照</h2></div><span class="subtle-tag">点击任意图片放大</span></div>
+    <div class="sample-controls panel">
+      <label class="prompt-select">Prompt<select id="prompt-select" aria-label="选择 prompt"></select></label>
+      <fieldset><legend>观察帧</legend><div class="segmented" id="frame-control"><button type="button" data-frame="0" aria-pressed="false">帧 0</button><button type="button" data-frame="1" aria-pressed="true">帧 4</button><button type="button" data-frame="2" aria-pressed="false">帧 8</button></div></fieldset>
+      <fieldset><legend>比较阶段</legend><div class="segmented" id="stage-control"><button type="button" data-stage="aligned_x0" aria-pressed="true">同 σ 的 x₀</button><button type="button" data-stage="final" aria-pressed="false">最终结果</button></div></fieldset>
+    </div>
+    <div class="prompt-context"><p id="prompt-text"></p><p id="sample-caption" class="muted"></p></div>
+    <div id="sample-grids" class="model-comparison" aria-live="polite"></div>
+    <aside id="prompt-observation" class="observation"></aside>
+    <details class="panel advanced"><summary>高级查看：同一 seed 从初始预测到最终结果</summary><p class="muted">五列依次为 AR 初始 x₀、AR 同 σ x₀、AR final、Wan 同 σ x₀、Wan final。初始 x₀ 是 σ = 1 上的预测，仅作时间锚点。</p><div class="scroll" id="trajectory-grid"></div></details>
+  </section>
+
+  <section id="diversity" class="section-block" aria-labelledby="diversity-title">
+    <div class="section-heading"><div><div class="eyebrow">02 · 跨 seed 的分散程度</div><h2 id="diversity-title">现在能不能说明 diversity？</h2></div></div>
+    <p class="section-intro"><strong>能描述这 24 个配对样本中的差异，尚不能证明总体的语义 diversity 排序。</strong>以下将可计算的 RGB 分散程度与视觉上的语义变化分别呈现。</p>
+    <div class="panel metric-panel">
+      <div class="metric-header"><div><h3>定量：跨 seed 低通 RGB MSE</h3><p class="muted">AR 距离 ÷ Wan 距离，越小表示 AR 在这个指标下越集中。</p></div><div class="segmented" id="metric-control" role="group" aria-label="指标阶段"><button type="button" data-metric="aligned_x0" aria-pressed="true">同 σ x₀</button><button type="button" data-metric="final" aria-pressed="false">最终结果</button></div></div>
+      <div class="ratio-key"><span>比值 &lt; 1：AR 的 RGB 更集中</span><span>比值 &gt; 1：AR 的 RGB 更分散</span><span>探索性 95% 区间 含 1：方向仍不确定</span></div>
+      <div id="ratio-chart" aria-label="逐 prompt 距离比值与 探索性 95% 区间"></div>
+      <div class="scroll"><table class="metric-table"><thead><tr><th scope="col">Prompt</th><th scope="col" class="ar-text">AR MSE</th><th scope="col" class="wan-text">Wan MSE</th><th scope="col">AR / Wan · 探索性 95% 区间</th><th scope="col">当前指标下的判断</th></tr></thead><tbody id="metric-rows"></tbody></table></div>
+      <p class="footnote">每个 prompt 8 个 seed、28 个不同 seed 对。以 8 个 seed 为单位有放回重采样，对原始身份不同的 pair（distinct-identity pair）按抽样次数乘积加权；重复抽中的同一身份不计为新 pair。探索性 95% 区间没有对 prompt 重采样，也未作多重比较校正，不代表跨 prompt 的泛化。三个观察帧共同降采样到 15 × 26 RGB 后计算，颜色、亮度和布局都会影响数值。</p>
+    </div>
+    <div class="semantic-panel panel"><h3>视觉：场景类别与构图偏好</h3><div id="semantic-cards" class="semantic-grid"></div><p class="footnote">这些观察来自同一批样本，尚未经过盲评或语义特征的独立验证。RGB 距离接近，也可能同时存在场景类别或镜头尺度的差异。</p><details class="metric-explainer"><summary>猫的画面看起来更多样，为什么 MSE 仍然接近？</summary><p>低通 RGB MSE 将所有像素差异压成一个平均数。相似构图里的颜色或亮度变化可以增大它；不同场景中相近的背景颜色又可能缩小它。因此，“杯边近景”和“地面水源远景”这样的语义变化，不一定带来更大的平均 RGB 距离。当前只能把视觉观察当作待验证的线索。</p><p id="cat-secondary" class="muted"></p></details></div>
+    <details class="next-evidence"><summary>要把 diversity 结论做实，还缺什么？</summary><div id="next-experiment"><p>扩大 prompt 与 seed；对 final 计算感知 / 语义特征距离，并单独标注构图、场景类别、物体与动作变化；同时报告 prompt 一致性与画质，避免把偏题或低质量样本当作多样性。若要解释成因，再在权重、CFG、调度器和时域匹配的控制下比较。</p></div></details>
+  </section>
+
+  <section id="retention" class="section-block" aria-labelledby="retention-title">
+    <div class="section-heading"><div><div class="eyebrow">03 · 单条轨迹的早期特征</div><h2 id="retention-title">结构保留：早期 x₀ 能否对应自己的 final？</h2></div></div>
+    <div class="panel"><p class="section-intro">把某个 seed 的早期 x₀，与同 prompt 下 8 个 final 分别计算低通 RGB 距离；最近的是自己的 final 就记为检索成功。<strong>它衡量轨迹内的可辨认性，不衡量模型覆盖了多少语义模式。</strong></p><div class="scroll"><table><thead><tr><th scope="col">Prompt</th><th scope="col" class="ar-text">AR 检索</th><th scope="col" class="wan-text">Wan 检索</th><th scope="col">AR 配对 / 错配距离</th><th scope="col">Wan 配对 / 错配距离</th></tr></thead><tbody id="retention-rows"></tbody></table></div><p class="footnote">单个 prompt 的机会水平为 1 / 8 = 12.5%。检索成功与“以后不会再改变”不同：只要自己的 final 比其他 seed 更接近即可。这里观察的是首个 chunk 的帧 0 / 4 / 8，不能直接推广到完整视频的时序多样性。</p></div>
+  </section>
+
+  <section id="controls" class="section-block" aria-labelledby="controls-title">
+    <div class="section-heading"><div><div class="eyebrow">04 · 后续噪声是否仍有影响</div><h2 id="controls-title">AR：固定初噪，更换后续 transition noise</h2></div></div>
+    <div class="panel"><p>用相同初始噪声重新采样，只替换后续注入的噪声。下表把这种变化与“更换初始噪声”的 final 差异相比。</p><div class="scroll"><table><thead><tr><th scope="col">Prompt</th><th scope="col">更换后续噪声的 MSE</th><th scope="col">跨初噪 final MSE</th><th scope="col">两者比值 · 探索性 95% 区间</th></tr></thead><tbody id="control-rows"></tbody></table></div><p class="takeaway">早期形成稳定特征，与后续仍可改变结果，可以同时成立。这个距离比例不等于“结构已经确定的百分比”。</p></div>
+  </section>
+
+  <section id="appendix" class="section-block appendix" aria-labelledby="appendix-title">
+    <div class="section-heading"><div><div class="eyebrow">05 · 可复核材料</div><h2 id="appendix-title">方法、限制与原始数据</h2></div></div>
+    <div id="downloads" class="downloads"></div>
+    <details class="panel"><summary>完整方法与解释边界</summary><ol id="warnings"></ol><h3>对齐定义与指标协议</h3><pre id="method-json"></pre></details>
+    <details class="panel"><summary>模型参数、阶段键名与实际 timestep / sigma</summary><pre id="parameters-json"></pre></details>
+    <details class="panel"><summary>原始 latent 的辅助统计（不作为语义 diversity 指标）</summary><p class="muted">共享 VAE 坐标中的描述性距离仍受尺度与图像质量影响；不用于识别完整概率分布。</p><div class="scroll" id="latent-table"></div><a href="latent_summary.json">打开完整 latent_summary.json</a></details>
+    <details class="panel"><summary>实验完整性与图像索引</summary><pre id="validation-json"></pre><div id="sheet-links" class="downloads"></div></details>
+    <details class="panel" id="assessment-details" hidden><summary>完整 diversity 评估依据</summary><pre id="assessment-json"></pre></details>
+  </section>
+  <footer>探索性实验 · 结论以当前 3 个 prompt、8 个 seed 与观察窗口为限。所有资源均保存在本地，可直接打开此 HTML。</footer>
+</main>
+<dialog id="image-modal" aria-labelledby="modal-caption"><div class="modal-toolbar"><p id="modal-caption"></p><button id="modal-close" type="button" aria-label="关闭放大图">关闭 ×</button></div><img id="modal-image" alt=""><p class="modal-hint">按 Esc 关闭</p></dialog>
+<noscript><p class="wrap panel">请开启 JavaScript 以使用 prompt、帧与阶段切换。原始统计可在同目录的 <a href="summary.json">summary.json</a> 中查看。</p></noscript>
+<script id="report-data" type="application/json">__REPORT_DATA__</script>
+<script>__REPORT_JS__</script>
+</body>
+</html>

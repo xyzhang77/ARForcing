@@ -7,7 +7,7 @@ from utils.misc import set_seed
 import torch.distributed as dist
 from omegaconf import OmegaConf
 import torch
-import wandb
+from torch.utils.tensorboard import SummaryWriter
 import time
 import os
 
@@ -30,7 +30,7 @@ class Trainer:
         self.device = torch.cuda.current_device()
         self.is_main_process = global_rank == 0
         self.causal = config.causal
-        self.disable_wandb = config.disable_wandb
+        self.writer = None
 
         # use a random seed for the training
         if config.seed == 0:
@@ -40,18 +40,11 @@ class Trainer:
 
         set_seed(config.seed + global_rank)
 
-        if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
-            wandb.init(
-                config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
-                mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
-                dir=config.wandb_save_dir
-            )
+        if self.is_main_process and not config.disable_tensorboard:
+            self.writer = SummaryWriter(log_dir=config.tensorboard_save_dir, flush_secs=10)
+            self.writer.add_text("config", f"```yaml\n{OmegaConf.to_yaml(config, resolve=True)}\n```", 0)
 
-        self.output_path = config.logdir
+        self.output_path = config.checkpoint_dir
 
         # Step 2: Initialize the model and optimizer
         self.model = CausalDiffusion(config, device=self.device)
@@ -153,12 +146,10 @@ class Trainer:
             }
 
         if self.is_main_process:
-            os.makedirs(os.path.join(self.output_path,
-                        f"checkpoint_model_{self.step:06d}"), exist_ok=True)
-            torch.save(state_dict, os.path.join(self.output_path,
-                       f"checkpoint_model_{self.step:06d}", "model.pt"))
-            print("Model saved to", os.path.join(self.output_path,
-                  f"checkpoint_model_{self.step:06d}", "model.pt"))
+            os.makedirs(self.output_path, exist_ok=True)
+            ckpt_path = os.path.join(self.output_path, f"step_{self.step:06d}.pt")
+            torch.save(state_dict, ckpt_path)
+            print("Model saved to", ckpt_path)
 
     def train_one_step(self, batch):
         self.log_iters = 1
@@ -214,15 +205,15 @@ class Trainer:
         # Increment the step since we finished gradient update
         self.step += 1
 
-        wandb_loss_dict = {
+        loss_dict = {
             "generator_loss": generator_loss.item(),
             "generator_grad_norm": generator_grad_norm.item(),
         }
 
         # Step 4: Logging
-        if self.is_main_process:
-            if not self.disable_wandb:
-                wandb.log(wandb_loss_dict, step=self.step)
+        if self.writer is not None:
+            for name, value in loss_dict.items():
+                self.writer.add_scalar(name, value, self.step)
 
         if self.step % self.config.gc_interval == 0:
             if dist.get_rank() == 0:
@@ -260,6 +251,6 @@ class Trainer:
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    if self.writer is not None:
+                        self.writer.add_scalar("per iteration time", current_time - self.previous_time, self.step)
                     self.previous_time = current_time

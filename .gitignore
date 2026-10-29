@@ -3,3 +3,10 @@ __pycache__
 
 wan_models
 checkpoints
+
+prompts
+logs
+
+.codegraph
+outputs
+proposals

@@ -89,9 +89,10 @@ torchrun --nnodes=8 --nproc_per_node=8 --rdzv_id=5235 \
   --rdzv_endpoint $MASTER_ADDR \
   train.py \
   --config_path configs/self_forcing_dmd.yaml \
-  --logdir logs/self_forcing_dmd \
-  --disable-wandb
+  --logdir logs/self_forcing_dmd
 ```
+TensorBoard logging is enabled by default. Run `tensorboard --logdir logs/self_forcing_dmd/tensorboard --port 6006` and open `http://localhost:6006` to view metrics. Use `--tensorboard-save-dir` to override the log directory or `--disable-tensorboard` to disable logging.
+
 Our training run uses 600 iterations and completes in under 2 hours using 64 H100 GPUs. By implementing gradient accumulation, it should be possible to reproduce the results in less than 16 hours using 8 H100 GPUs.
 
 ## Acknowledgements

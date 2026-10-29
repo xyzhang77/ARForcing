@@ -9,7 +9,7 @@ from utils.misc import (
 import torch.distributed as dist
 from omegaconf import OmegaConf
 import torch
-import wandb
+from torch.utils.tensorboard import SummaryWriter
 import time
 import os
 
@@ -32,7 +32,7 @@ class Trainer:
         self.dtype = torch.bfloat16 if config.mixed_precision else torch.float32
         self.device = torch.cuda.current_device()
         self.is_main_process = global_rank == 0
-        self.disable_wandb = config.disable_wandb
+        self.writer = None
 
         # use a random seed for the training
         if config.seed == 0:
@@ -42,18 +42,11 @@ class Trainer:
 
         set_seed(config.seed + global_rank)
 
-        if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
-            wandb.init(
-                config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
-                mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
-                dir=config.wandb_save_dir
-            )
+        if self.is_main_process and not config.disable_tensorboard:
+            self.writer = SummaryWriter(log_dir=config.tensorboard_save_dir, flush_secs=10)
+            self.writer.add_text("config", f"```yaml\n{OmegaConf.to_yaml(config, resolve=True)}\n```", 0)
 
-        self.output_path = config.logdir
+        self.output_path = config.checkpoint_dir
 
         # Step 2: Initialize the model and optimizer
 
@@ -124,12 +117,10 @@ class Trainer:
         }
 
         if self.is_main_process:
-            os.makedirs(os.path.join(self.output_path,
-                        f"checkpoint_model_{self.step:06d}"), exist_ok=True)
-            torch.save(state_dict, os.path.join(self.output_path,
-                       f"checkpoint_model_{self.step:06d}", "model.pt"))
-            print("Model saved to", os.path.join(self.output_path,
-                  f"checkpoint_model_{self.step:06d}", "model.pt"))
+            os.makedirs(self.output_path, exist_ok=True)
+            ckpt_path = os.path.join(self.output_path, f"step_{self.step:06d}.pt")
+            torch.save(state_dict, ckpt_path)
+            print("Model saved to", ckpt_path)
 
     def train_one_step(self):
         VISUALIZE = self.step % 100 == 0
@@ -188,7 +179,7 @@ class Trainer:
         self.generator_optimizer.step()
 
         # Step 4: Visualization
-        if VISUALIZE and not self.config.no_visualize and not self.config.disable_wandb and self.is_main_process:
+        if VISUALIZE and not self.config.no_visualize and self.writer is not None:
             # Visualize the input, output, and ground truth
             input = log_dict["input"]
             output = log_dict["output"]
@@ -197,25 +188,24 @@ class Trainer:
             input_video = self.model.vae.decode_to_pixel(input)
             output_video = self.model.vae.decode_to_pixel(output)
             ground_truth_video = self.model.vae.decode_to_pixel(ground_truth)
-            input_video = 255.0 * (input_video.cpu().numpy() * 0.5 + 0.5)
-            output_video = 255.0 * (output_video.cpu().numpy() * 0.5 + 0.5)
-            ground_truth_video = 255.0 * (ground_truth_video.cpu().numpy() * 0.5 + 0.5)
+            input_video = (input_video.detach().float().cpu() * 0.5 + 0.5).clamp(0, 1)
+            output_video = (output_video.detach().float().cpu() * 0.5 + 0.5).clamp(0, 1)
+            ground_truth_video = (ground_truth_video.detach().float().cpu() * 0.5 + 0.5).clamp(0, 1)
 
             # Visualize the input, output, and ground truth
-            wandb.log({
-                "input": wandb.Video(input_video, caption="Input", fps=16, format="mp4"),
-                "output": wandb.Video(output_video, caption="Output", fps=16, format="mp4"),
-                "ground_truth": wandb.Video(ground_truth_video, caption="Ground Truth", fps=16, format="mp4"),
-            }, step=self.step)
+            self.writer.add_video("input", input_video, self.step, fps=16)
+            self.writer.add_video("output", output_video, self.step, fps=16)
+            self.writer.add_video("ground_truth", ground_truth_video, self.step, fps=16)
 
         # Step 5: Logging
-        if self.is_main_process and not self.disable_wandb:
-            wandb_loss_dict = {
+        if self.writer is not None:
+            loss_dict = {
                 "generator_loss": generator_loss.item(),
                 "generator_grad_norm": generator_grad_norm.item(),
                 **stats
             }
-            wandb.log(wandb_loss_dict, step=self.step)
+            for name, value in loss_dict.items():
+                self.writer.add_scalar(name, value, self.step)
 
         if self.step % self.config.gc_interval == 0:
             if dist.get_rank() == 0:
@@ -235,8 +225,8 @@ class Trainer:
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    if self.writer is not None:
+                        self.writer.add_scalar("per iteration time", current_time - self.previous_time, self.step)
                     self.previous_time = current_time
 
             self.step += 1

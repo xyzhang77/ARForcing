@@ -11,7 +11,7 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import GAN
 import torch
-import wandb
+from torch.utils.tensorboard import SummaryWriter
 import time
 import os
 
@@ -33,7 +33,7 @@ class Trainer:
         self.device = torch.cuda.current_device()
         self.is_main_process = global_rank == 0
         self.causal = config.causal
-        self.disable_wandb = config.disable_wandb
+        self.writer = None
 
         # Configuration for discriminator warmup
         self.discriminator_warmup_steps = getattr(config, "discriminator_warmup_steps", 0)
@@ -50,18 +50,11 @@ class Trainer:
 
         set_seed(config.seed + global_rank)
 
-        if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
-            wandb.init(
-                config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
-                mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
-                dir=config.wandb_save_dir
-            )
+        if self.is_main_process and not config.disable_tensorboard:
+            self.writer = SummaryWriter(log_dir=config.tensorboard_save_dir, flush_secs=10)
+            self.writer.add_text("config", f"```yaml\n{OmegaConf.to_yaml(config, resolve=True)}\n```", 0)
 
-        self.output_path = config.logdir
+        self.output_path = config.checkpoint_dir
 
         # Step 2: Initialize the model and optimizer
         self.model = GAN(config, device=self.device)
@@ -225,12 +218,10 @@ class Trainer:
             }
 
         if self.is_main_process:
-            os.makedirs(os.path.join(self.output_path,
-                        f"checkpoint_model_{self.step:06d}"), exist_ok=True)
-            torch.save(state_dict, os.path.join(self.output_path,
-                       f"checkpoint_model_{self.step:06d}", "model.pt"))
-            print("Model saved to", os.path.join(self.output_path,
-                  f"checkpoint_model_{self.step:06d}", "model.pt"))
+            os.makedirs(self.output_path, exist_ok=True)
+            ckpt_path = os.path.join(self.output_path, f"step_{self.step:06d}.pt")
+            torch.save(state_dict, ckpt_path)
+            print("Model saved to", ckpt_path)
 
     def fwdbwd_one_step(self, batch, train_generator):
         self.model.eval()  # prevent any randomness (e.g. dropout)
@@ -413,8 +404,7 @@ class Trainer:
                 torch.cuda.empty_cache()
 
             # Logging
-            wandb_loss_dict = {
-                "generator_grad_norm": generator_log_dict["generator_grad_norm"],
+            loss_dict = {
                 "critic_grad_norm": critic_log_dict["critic_grad_norm"],
                 "real_logit": critic_log_dict["noisy_real_logit"],
                 "fake_logit": critic_log_dict["noisy_fake_logit"],
@@ -422,22 +412,23 @@ class Trainer:
                 "r2_loss": critic_log_dict["r2_loss"],
             }
             if TRAIN_GENERATOR:
-                wandb_loss_dict.update({
+                loss_dict.update({
                     "generator_grad_norm": generator_log_dict["generator_grad_norm"],
                 })
-            self.all_gather_dict(wandb_loss_dict)
-            wandb_loss_dict["diff_logit"] = wandb_loss_dict["real_logit"] - wandb_loss_dict["fake_logit"]
-            wandb_loss_dict["reg_loss"] = 0.5 * (wandb_loss_dict["r1_loss"] + wandb_loss_dict["r2_loss"])
+            self.all_gather_dict(loss_dict)
+            loss_dict["diff_logit"] = loss_dict["real_logit"] - loss_dict["fake_logit"]
+            loss_dict["reg_loss"] = 0.5 * (loss_dict["r1_loss"] + loss_dict["r2_loss"])
 
             if self.is_main_process:
                 if self.in_discriminator_warmup:
                     warmup_status = f"[WARMUP {self.step}/{self.discriminator_warmup_steps}] Training only discriminator params"
                     print(warmup_status)
-                    if not self.disable_wandb:
-                        wandb_loss_dict.update({"warmup_status": 1.0})
+                    if self.writer is not None:
+                        loss_dict.update({"warmup_status": 1.0})
 
-                if not self.disable_wandb:
-                    wandb.log(wandb_loss_dict, step=self.step)
+                if self.writer is not None:
+                    for name, value in loss_dict.items():
+                        self.writer.add_scalar(name, value, self.step)
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:
@@ -450,8 +441,8 @@ class Trainer:
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    if self.writer is not None:
+                        self.writer.add_scalar("per iteration time", current_time - self.previous_time, self.step)
                     self.previous_time = current_time
 
     def all_gather_dict(self, target_dict):

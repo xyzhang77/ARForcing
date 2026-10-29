@@ -16,7 +16,7 @@ def init_model(device):
     model.model.requires_grad_(False)
 
     scheduler = FlowMatchScheduler(
-        shift=8.0, sigma_min=0.0, extra_one_step=True)
+        shift=5.0, sigma_min=0.0, extra_one_step=True)
     scheduler.set_timesteps(num_inference_steps=48, denoising_strength=1.0)
     scheduler.sigmas = scheduler.sigmas.to(device)
 
@@ -58,9 +58,9 @@ def main():
         prompt_index = index * dist.get_world_size() + dist.get_rank()
         if prompt_index >= len(dataset):
             continue
-        prompt = dataset[prompt_index]
+        prompt = dataset[prompt_index]["prompts"]
 
-        conditional_dict = encoder(text_prompts=prompt)
+        conditional_dict = encoder(text_prompts=[prompt])
 
         latents = torch.randn(
             [1, 21, 16, 60, 104], dtype=torch.float32, device=device
